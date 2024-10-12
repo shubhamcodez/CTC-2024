@@ -21,7 +21,7 @@ class Backtester:
     self.orders["sort_by"] = pd.to_datetime(self.orders["datetime"])
     self.orders = self.orders.sort_values(by="sort_by")
 
-    self.options : pd.DataFrame = pd.read_csv("data/cleaned_options_data.csv")
+    self.options : pd.DataFrame = pd.read_csv("data/options_data.csv")
     self.options["day"] = self.options["ts_recv"].apply(lambda x: x.split("T")[0])
     self.options["hour"] = self.options["ts_recv"].apply(lambda x: int(x.split("T")[1].split(".")[0].split(":")[0]))
 

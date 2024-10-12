@@ -46,7 +46,7 @@ class Strategy:
             date_with_tz = pd.to_datetime(date).tz_localize('UTC')
 
             valid_options = self.options[(
-                self.options['expiry'] > date_with_tz) &
+                self.options['expiry'] > date_with_tz) & 
                 (self.options['expiry'] != date_with_tz + timedelta(days=1))
             ] 
 
@@ -109,9 +109,9 @@ class Strategy:
                     }
 
             # Risk Management Checks
-            self.close_positions_if_needed()
+            self.close_positions()
 
-    def close_positions_if_needed(self):
+    def close_positions(self):
         for option_symbol, details in list(self.current_positions.items()):
             entry_price = details["entry_price"]
             current_price = self.get_current_price(option_symbol)  # Fetch current price using timestamps
@@ -150,17 +150,27 @@ class Strategy:
 
     def generate_orders(self) -> pd.DataFrame:
         orders = []
-        
+
+        # Iterate through all positions and their corresponding orders
         for position in self.positions:
             for order in position['orders']:
-                # Create a unique order for each entry in positions
+                # Retrieve details from the order
+                option_symbol = order["option_symbol"]  # Unique identifier for the option
+                expiration_date = self.get_expiration_date(option_symbol)  # Get the expiration date
+                formatted_expiration_date = expiration_date.strftime("%Y%m%d")  # Format the date to YYYYMMDD
+                option_type = order["option_kind"]  # Option type (Call or Put)
+                strike_price = self.options[self.options['symbol'] == option_symbol]['strike'].iloc[0]  # Get strike price from options data
+
+                # Construct the option symbol in the required format
+                formatted_option_symbol = f"SPX{formatted_expiration_date}{option_type[0].upper()}{int(strike_price)}"
+
+                # Append each order to the orders list with necessary attributes
                 orders.append({
-                    "datetime": order["datetime"],
-                    "option_symbol": order["option_symbol"],
-                    "action": order["action"],  # Should be "Buy" or "Sell"
-                    "order_size": order["order_size"],
-                    "order_type": order["order_type"],
-                    "option_kind": order["option_kind"]  # Adds option kind for further analysis
+                    "Datetime": order["datetime"],            # Timestamp of the order
+                    "Option Symbol": formatted_option_symbol,  # The formatted option symbol
+                    "Action": order["action"],                # Action to take: "Buy" or "Sell"
+                    "Order Size": order["order_size"]         # Size of the order
                 })
-        
+
+        # Create a DataFrame from the orders list
         return pd.DataFrame(orders)

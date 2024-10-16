@@ -1,176 +1,245 @@
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
+from scipy.stats import norm
+from scipy.integrate import quad
+from scipy.optimize import minimize
+import pytz
 
 class Strategy:
-  
     def __init__(self) -> None:
         self.capital: float = 100_000_000
         self.portfolio_value: float = 0
+        self.start_date: datetime = datetime(2024, 1, 1, tzinfo=pytz.UTC)
+        self.end_date: datetime = datetime(2024, 1, 3, tzinfo=pytz.UTC)
+        
+        # Load and preprocess data
+        self.load_and_preprocess_data()
+        
+        # Initialize Heston parameters
+        self.kappa = 2.0
+        self.theta = 0.04
+        self.sigma = 0.3
+        self.rho = -0.7
+        self.v0 = 0.04
 
-        self.start_date: datetime = datetime(2024, 1, 1)
-        self.end_date: datetime = datetime(2024, 3, 30)
-  
-        self.options: pd.DataFrame = pd.read_csv("data/options_data.csv")
-        self.options["day"] = self.options["ts_recv"].apply(lambda x: x.split("T")[0])
+        # Calibrate Heston parameters using historical data
+        self.calibrate_heston_parameters()
 
-        self.underlying = pd.read_csv("data/underlying_data_hour.csv")
-        self.underlying.columns = self.underlying.columns.str.lower()
+        self.positions = {}
+        self.orders = []
 
-        # Convert date column to datetime
-        self.underlying['date'] = pd.to_datetime(self.underlying['date'])
+    def load_and_preprocess_data(self):
+        # Load options data
+        self.options = pd.read_csv("data/cleaned_options_data.csv")
+        self.options["ts_recv"] = pd.to_datetime(self.options["ts_recv"])
+        self.options["day"] = self.options["ts_recv"].dt.date
+        
+        # Updated symbol parsing
+        def parse_symbol(symbol):
+            try:
+                expiration = pd.to_datetime(symbol[3:9], format="%y%m%d")
+                strike = float(symbol[9:-1]) / 1000
+                option_type = 'Call' if symbol[-1] == 'C' else 'Put'
+                return pd.Series([expiration, strike, option_type])
+            except:
+                return pd.Series([pd.NaT, np.nan, ''])
 
-        self.positions = []  # Store positions generated from the create_positions method
-        self.current_positions = {}  # Dictionary to track current positions and their entry prices
+        symbol_data = self.options["symbol"].apply(parse_symbol)
+        self.options[["expiration", "strike", "option_type"]] = symbol_data
+        
+        # Load underlying data
+        self.underlying = pd.read_csv("data/spx_minute_level_data_jan_mar_2024.csv")
+        self.underlying.columns = ["ms_of_day", "price", "date"]
+        self.underlying["date"] = pd.to_datetime(self.underlying["date"].astype(str), format="%Y%m%d")
+        self.underlying["time"] = pd.to_timedelta(self.underlying["ms_of_day"], unit='ms')
+        self.underlying["datetime"] = (self.underlying["date"] + self.underlying["time"])
+        self.underlying = self.underlying.sort_values("datetime")
 
-        # Risk management parameters
-        self.max_loss_percentage = 0.1  # Set max loss at 10% of capital
-        self.days_before_expiry_to_close = 2  # Number of days to close positions before expiry
+    def calibrate_heston_parameters(self):
+        print("Calibrating Heston model parameters using historical data...")
+        
+        # Use data up to the start date for calibration
+        historical_options = self.options[self.options['ts_recv'] < self.start_date]
+        
+        if historical_options.empty:
+            print("No historical data available for calibration. Using default parameters.")
+            return
+        
+        # Select a subset of historical options for calibration
+        calibration_options = historical_options.sample(min(1000, len(historical_options)))
+        
+        # Define the objective function
+        def objective(params):
+            self.kappa, self.theta, self.sigma, self.rho, self.v0 = params
+            total_error = 0
+            for _, option in calibration_options.iterrows():
+                S = self.get_underlying_price(option['ts_recv'])
+                K = option['strike']
+                T = (option['expiration'] - option['ts_recv']).total_seconds() / (365 * 24 * 3600)
+                r = 0.03  # Assumed risk-free rate
+                market_price = (option['bid_px_00'] + option['ask_px_00']) / 2
+                model_price = self.heston_price(S, K, T, r, option['option_type'])
+                total_error += (market_price - model_price)**2
+            return total_error
 
-    def place_order(self, order_type: str, datetime: str, option_symbol: str, action: str, order_size: int, option_kind: str):
-        """Helper function to create an order dictionary."""
-        return {
-            "datetime": datetime,
-            "option_symbol": option_symbol,
-            "action": action,
-            "order_size": order_size,
-            "order_type": order_type,  # Include order type for reference
-            "option_kind": option_kind   # Indicates if it's a Put or Call
-        }
+        # Initial guess and bounds
+        initial_guess = [self.kappa, self.theta, self.sigma, self.rho, self.v0]
+        bounds = [(0.1, 10), (0.01, 0.5), (0.1, 1), (-0.99, 0.99), (0.01, 0.5)]
 
-    def create_positions(self):
-        prices_df = self.underlying  # Using underlying data as prices for this example
-        daily_prices = prices_df.groupby(prices_df['date'].dt.date)
+        # Perform the optimization
+        result = minimize(objective, initial_guess, method='L-BFGS-B', bounds=bounds)
 
-        for date, daily_data in daily_prices:
-            opening_price = daily_data.iloc[0]['open']
-            date_with_tz = pd.to_datetime(date).tz_localize('UTC')
+        # Update the parameters
+        self.kappa, self.theta, self.sigma, self.rho, self.v0 = result.x
 
-            valid_options = self.options[(
-                self.options['expiry'] > date_with_tz) & 
-                (self.options['expiry'] != date_with_tz + timedelta(days=1))
-            ] 
+        print(f"Calibrated parameters: kappa={self.kappa:.4f}, theta={self.theta:.4f}, "
+              f"sigma={self.sigma:.4f}, rho={self.rho:.4f}, v0={self.v0:.4f}")
 
-            # Filter options
-            put_options = valid_options[valid_options['type'] == 'Put']
-            call_options = valid_options[valid_options['type'] == 'Call']
-            strikes = put_options['strike'].sort_values().unique()
+    def heston_characteristic_function(self, u, S, K, T, r, v):
+        i = complex(0, 1)
+        
+        a = self.kappa * self.theta
+        b = self.kappa - self.rho * self.sigma * i * u
+        
+        d = np.sqrt(b**2 + self.sigma**2 * (u**2 + i*u))
+        g = (b - d) / (b + d)
+        
+        C = r * i * u * T + a / self.sigma**2 * (
+            (b - d) * T - 2 * np.log((1 - g * np.exp(-d * T)) / (1 - g))
+        )
+        D = (b - d) / self.sigma**2 * ((1 - np.exp(-d * T)) / (1 - g * np.exp(-d * T)))
+        
+        return np.exp(C + D * v + i * u * np.log(S))
 
-            # Check for Short Iron Condor setup
-            if len(strikes) >= 4:
-                long_put_1 = strikes[-1]  # Lowest strike for the put bought
-                short_put_1 = strikes[-2]  # Highest strike for the put sold
-                short_call_1 = strikes[-3]  # Lowest strike for the call sold
-                long_call_2 = strikes[-4]    # Highest strike for the call bought
+    def heston_price(self, S, K, T, r, option_type):
+        v = self.v0  # Use the calibrated initial variance
+        i = complex(0, 1)  # Define the imaginary unit
+    
+        def integrand(u, S, K, T, r, v, flag):
+            if flag:
+                return np.real(np.exp(-i*u*np.log(K)) * self.heston_characteristic_function(u-i, S, K, T, r, v) / (i*u))
+            else:
+                return np.real(np.exp(-i*u*np.log(K)) * self.heston_characteristic_function(u, S, K, T, r, v) / (i*u))
+    
+        P1 = 0.5 + 1/np.pi * quad(integrand, 0, 100, args=(S, K, T, r, v, True))[0]
+        P2 = 0.5 + 1/np.pi * quad(integrand, 0, 100, args=(S, K, T, r, v, False))[0]
+    
+        if option_type == "Call":
+            return S * P1 - K * np.exp(-r * T) * P2
+        else:
+            return K * np.exp(-r * T) * (1 - P2) - S * (1 - P1)
 
-                # Create orders for Short Iron Condor
-                short_iron_condor_orders = [
-                    self.place_order("Short Iron Condor", put_options[put_options['strike'] == short_put_1].iloc[0]['ts_recv'], short_put_1, "Sell", 1, "Put"),
-                    self.place_order("Short Iron Condor", call_options[call_options['strike'] == short_call_1].iloc[0]['ts_recv'], short_call_1, "Sell", 1, "Call"),
-                    self.place_order("Short Iron Condor", put_options[put_options['strike'] == long_put_1].iloc[0]['ts_recv'], long_put_1, "Buy", 1, "Put"),
-                    self.place_order("Short Iron Condor", call_options[call_options['strike'] == long_call_2].iloc[0]['ts_recv'], long_call_2, "Buy", 1, "Call")
-                ]
+    def calculate_delta(self, S, K, T, r, option_type):
+        epsilon = 0.0001
+        price1 = self.heston_price(S - epsilon, K, T, r, option_type)
+        price2 = self.heston_price(S + epsilon, K, T, r, option_type)
+        return (price2 - price1) / (2 * epsilon)
 
-                self.positions.append({
-                    'date': date,
-                    'type': 'Short Iron Condor',
-                    'orders': short_iron_condor_orders,
-                    'opening_price': opening_price
-                })
-
-                # Track current positions
-                for order in short_iron_condor_orders:
-                    self.current_positions[order["option_symbol"]] = {
-                        "order_size": order["order_size"],
-                        "entry_price": opening_price
-                    }
-
-            # Check for Long Straddle setup
-            if len(call_options) > 0 and len(put_options) > 0:
-                atm_strike = min(strikes, key=lambda x: abs(x - opening_price))
-
-                # Create orders for Long Straddle
-                long_straddle_orders = [
-                    self.place_order("Long Straddle", put_options[put_options['strike'] == atm_strike].iloc[0]['ts_recv'], atm_strike, "Buy", 1, "Put"),
-                    self.place_order("Long Straddle", call_options[call_options['strike'] == atm_strike].iloc[0]['ts_recv'], atm_strike, "Buy", 1, "Call")
-                ]
-
-                self.positions.append({
-                    'date': date,
-                    'type': 'Long Straddle',
-                    'orders': long_straddle_orders,
-                    'opening_price': opening_price
-                })
-
-                # Track current positions
-                for order in long_straddle_orders:
-                    self.current_positions[order["option_symbol"]] = {
-                        "order_size": order["order_size"],
-                        "entry_price": opening_price
-                    }
-
-            # Risk Management Checks
-            self.close_positions()
-
-    def close_positions(self):
-        for option_symbol, details in list(self.current_positions.items()):
-            entry_price = details["entry_price"]
-            current_price = self.get_current_price(option_symbol)  # Fetch current price using timestamps
-
-            # Check if the loss threshold is exceeded
-            if (entry_price - current_price) / entry_price > self.max_loss_percentage:
-                print(f"Closing position for {option_symbol} due to exceeded loss threshold.")
-                self.close_order(option_symbol)
-
-            # Check if the position should be closed before expiry
-            expiration_date = self.get_expiration_date(option_symbol)
-            if (expiration_date - datetime.now()).days < self.days_before_expiry_to_close:
-                print(f"Closing position for {option_symbol} before expiration.")
-                self.close_order(option_symbol)
-
-    def close_order(self, option_symbol):
-        order_size = self.current_positions[option_symbol]["order_size"]
-        # Implement logic to close the order here
-        print(f"Closing order: {option_symbol} with size: {order_size}")
-        # Reset the position after closing
-        self.current_positions.pop(option_symbol)
-
-    def get_current_price(self, option_symbol):
-        """Fetch the current price of the option using the timestamp of the order."""
-        timestamp = pd.to_datetime(option_symbol)  # Use option_symbol as timestamp
-        # Find the price closest to the timestamp in the underlying data
-        price_row = self.underlying.loc[
-            self.underlying['date'].dt.date <= timestamp.date()
-        ].iloc[-1]  # Get the last price before or at the timestamp
-        return price_row['close']  # Return the close price
-
-    def get_expiration_date(self, option_symbol):
-        """Assumes the expiration date is available in the options DataFrame."""
-        # Get expiration date from options data
-        return pd.to_datetime(self.options[self.options['symbol'] == option_symbol]['expiry'].iloc[0])  # Placeholder for expiration date retrieval
+    def get_underlying_price(self, datetime):
+        price = self.underlying[self.underlying["datetime"] <= datetime]["price"].iloc[-1]
+        return price
 
     def generate_orders(self) -> pd.DataFrame:
-        orders = []
+        for date in pd.date_range(self.start_date, self.end_date):
+            date = date.replace(tzinfo=pytz.UTC)
+            day_options = self.options[self.options["day"] == date.date()]
+            if day_options.empty:
+                continue
+            
+            grouped_options = day_options.groupby("ts_recv")
+            
+            for ts_recv, options_group in grouped_options:
+                underlying_price = self.get_underlying_price(ts_recv)
+                
+                target_expiry = date + timedelta(days=30)
+                eligible_options = options_group[
+                    (options_group["expiration"] > target_expiry) & 
+                    (options_group["expiration"] <= target_expiry + timedelta(days=15)) &
+                    (options_group["strike"].between(0.95 * underlying_price, 1.05 * underlying_price))
+                ]
+                
+                if eligible_options.empty:
+                    continue
+                
+                call = eligible_options[eligible_options["option_type"] == "Call"].iloc[0]
+                put = eligible_options[eligible_options["option_type"] == "Put"].iloc[0]
+                
+                for option in [call, put]:
+                    symbol = option["symbol"]
+                    option_type = option["option_type"]
+                    strike = option["strike"]
+                    expiry = option["expiration"]
+                    T = (expiry - date).total_seconds() / (365 * 24 * 3600)
+                    r = 0.03  # Assumed risk-free rate
+                    
+                    theoretical_price = self.heston_price(underlying_price, strike, T, r, option_type)
+                    market_price = (option["bid_px_00"] + option["ask_px_00"]) / 2
+                    
+                    if theoretical_price > market_price * 1.01:
+                        action = "B"
+                        size = min(10, int(option["ask_sz_00"]))
+                    elif theoretical_price < market_price * 0.99:
+                        action = "S"
+                        size = min(10, int(option["bid_sz_00"]))
+                    else:
+                        continue
+                    
+                    self.orders.append({
+                        "datetime": ts_recv,
+                        "option_symbol": symbol,
+                        "action": action,
+                        "order_size": size
+                    })
+                    
+                    if symbol not in self.positions:
+                        self.positions[symbol] = 0
+                    self.positions[symbol] += size if action == "B" else -size
+                
+                total_delta = 0
+                for symbol, position in self.positions.items():
+                    option = self.options[self.options["symbol"] == symbol].iloc[0]
+                    delta = self.calculate_delta(underlying_price, option["strike"], 
+                                                 (option["expiration"] - date).total_seconds() / (365 * 24 * 3600), 
+                                                 r, option["option_type"])
+                    total_delta += position * delta * 100
+                
+                hedge_size = int(-total_delta / 100)
+                if hedge_size != 0:
+                    atm_call = eligible_options[(eligible_options["option_type"] == "Call") & 
+                                                (eligible_options["strike"] == eligible_options["strike"].min())].iloc[0]
+                    atm_put = eligible_options[(eligible_options["option_type"] == "Put") & 
+                                               (eligible_options["strike"] == eligible_options["strike"].min())].iloc[0]
+                    
+                    self.orders.append({
+                        "datetime": ts_recv,
+                        "option_symbol": atm_call["symbol"],
+                        "action": "B" if hedge_size > 0 else "S",
+                        "order_size": abs(hedge_size)
+                    })
+                    
+                    self.orders.append({
+                        "datetime": ts_recv,
+                        "option_symbol": atm_put["symbol"],
+                        "action": "S" if hedge_size > 0 else "B",
+                        "order_size": abs(hedge_size)
+                    })
+        
+        return pd.DataFrame(self.orders)
 
-        # Iterate through all positions and their corresponding orders
-        for position in self.positions:
-            for order in position['orders']:
-                # Retrieve details from the order
-                option_symbol = order["option_symbol"]  # Unique identifier for the option
-                expiration_date = self.get_expiration_date(option_symbol)  # Get the expiration date
-                formatted_expiration_date = expiration_date.strftime("%Y%m%d")  # Format the date to YYYYMMDD
-                option_type = order["option_kind"]  # Option type (Call or Put)
-                strike_price = self.options[self.options['symbol'] == option_symbol]['strike'].iloc[0]  # Get strike price from options data
+# Instantiate the strategy
+strategy = Strategy()
 
-                # Construct the option symbol in the required format
-                formatted_option_symbol = f"SPX{formatted_expiration_date}{option_type[0].upper()}{int(strike_price)}"
+# Generate orders
+orders = strategy.generate_orders()
 
-                # Append each order to the orders list with necessary attributes
-                orders.append({
-                    "Datetime": order["datetime"],            # Timestamp of the order
-                    "Option Symbol": formatted_option_symbol,  # The formatted option symbol
-                    "Action": order["action"],                # Action to take: "Buy" or "Sell"
-                    "Order Size": order["order_size"]         # Size of the order
-                })
+# Print the first few orders
+print("\nFirst few generated orders:")
+print(orders.head())
 
-        # Create a DataFrame from the orders list
-        return pd.DataFrame(orders)
+# Print some statistics about the orders
+print("\nOrder statistics:")
+print(f"Total number of orders: {len(orders)}")
+print(f"Number of buy orders: {len(orders[orders['action'] == 'B'])}")
+print(f"Number of sell orders: {len(orders[orders['action'] == 'S'])}")
+print(f"Average order size: {orders['order_size'].mean():.2f}")

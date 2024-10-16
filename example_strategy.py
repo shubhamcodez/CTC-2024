@@ -5,13 +5,14 @@ from scipy.stats import norm
 from scipy.integrate import quad
 from scipy.optimize import minimize
 import pytz
+from tqdm import tqdm
 
 class Strategy:
     def __init__(self) -> None:
         self.capital: float = 100_000_000
         self.portfolio_value: float = 0
         self.start_date: datetime = datetime(2024, 1, 1, tzinfo=pytz.UTC)
-        self.end_date: datetime = datetime(2024, 1, 3, tzinfo=pytz.UTC)
+        self.end_date: datetime = datetime(2024, 3, 30, tzinfo=pytz.UTC)
         
         # Load and preprocess data
         self.load_and_preprocess_data()
@@ -32,28 +33,25 @@ class Strategy:
     def load_and_preprocess_data(self):
         # Load options data
         self.options = pd.read_csv("data/cleaned_options_data.csv")
-        self.options["ts_recv"] = pd.to_datetime(self.options["ts_recv"])
-        self.options["day"] = self.options["ts_recv"].dt.date
+        self.options["ts_recv"] = pd.to_datetime(self.options["ts_recv"], utc=True)
         
-        # Updated symbol parsing
-        def parse_symbol(symbol):
-            try:
-                expiration = pd.to_datetime(symbol[3:9], format="%y%m%d")
-                strike = float(symbol[9:-1]) / 1000
-                option_type = 'Call' if symbol[-1] == 'C' else 'Put'
-                return pd.Series([expiration, strike, option_type])
-            except:
-                return pd.Series([pd.NaT, np.nan, ''])
-
-        symbol_data = self.options["symbol"].apply(parse_symbol)
-        self.options[["expiration", "strike", "option_type"]] = symbol_data
+        # Extract information from symbol
+        self.options['expiry'] = pd.to_datetime(self.options['symbol'].str.extract('(\d{6})')[0], format='%y%m%d', utc=True)
+        self.options['type'] = self.options['symbol'].str[-9].map({'C': 'Call', 'P': 'Put'})
+        self.options['strike'] = self.options['symbol'].str[-8:].astype(float) / 1000
+        
+        # Calculate days till expiry
+        self.options['days_till_expiry'] = (self.options['expiry'] - self.options['ts_recv']).dt.days
+        
+        # Create a 'day' column for filtering
+        self.options["day"] = self.options["ts_recv"].dt.date
         
         # Load underlying data
         self.underlying = pd.read_csv("data/spx_minute_level_data_jan_mar_2024.csv")
         self.underlying.columns = ["ms_of_day", "price", "date"]
         self.underlying["date"] = pd.to_datetime(self.underlying["date"].astype(str), format="%Y%m%d")
         self.underlying["time"] = pd.to_timedelta(self.underlying["ms_of_day"], unit='ms')
-        self.underlying["datetime"] = (self.underlying["date"] + self.underlying["time"])
+        self.underlying["datetime"] = (self.underlying["date"] + self.underlying["time"]).dt.tz_localize('UTC')
         self.underlying = self.underlying.sort_values("datetime")
 
     def calibrate_heston_parameters(self):
@@ -76,10 +74,10 @@ class Strategy:
             for _, option in calibration_options.iterrows():
                 S = self.get_underlying_price(option['ts_recv'])
                 K = option['strike']
-                T = (option['expiration'] - option['ts_recv']).total_seconds() / (365 * 24 * 3600)
+                T = (option['expiry'] - option['ts_recv']).total_seconds() / (365 * 24 * 3600)
                 r = 0.03  # Assumed risk-free rate
                 market_price = (option['bid_px_00'] + option['ask_px_00']) / 2
-                model_price = self.heston_price(S, K, T, r, option['option_type'])
+                model_price = self.heston_price(S, K, T, r, option['type'])
                 total_error += (market_price - model_price)**2
             return total_error
 
@@ -137,109 +135,56 @@ class Strategy:
         return (price2 - price1) / (2 * epsilon)
 
     def get_underlying_price(self, datetime):
-        price = self.underlying[self.underlying["datetime"] <= datetime]["price"].iloc[-1]
+        # Convert the input datetime to UTC to match the underlying data format
+        datetime_utc = datetime.astimezone(pytz.UTC)
+        
+        # Select the price based on the most recent datetime
+        price = self.underlying[self.underlying["datetime"] <= datetime_utc]["price"].iloc[-1]
         return price
 
     def generate_orders(self) -> pd.DataFrame:
-        for date in pd.date_range(self.start_date, self.end_date):
-            date = date.replace(tzinfo=pytz.UTC)
-            day_options = self.options[self.options["day"] == date.date()]
-            if day_options.empty:
-                continue
-            
-            grouped_options = day_options.groupby("ts_recv")
-            
-            for ts_recv, options_group in grouped_options:
-                underlying_price = self.get_underlying_price(ts_recv)
-                
-                target_expiry = date + timedelta(days=30)
-                eligible_options = options_group[
-                    (options_group["expiration"] > target_expiry) & 
-                    (options_group["expiration"] <= target_expiry + timedelta(days=15)) &
-                    (options_group["strike"].between(0.95 * underlying_price, 1.05 * underlying_price))
-                ]
-                
-                if eligible_options.empty:
-                    continue
-                
-                call = eligible_options[eligible_options["option_type"] == "Call"].iloc[0]
-                put = eligible_options[eligible_options["option_type"] == "Put"].iloc[0]
-                
-                for option in [call, put]:
-                    symbol = option["symbol"]
-                    option_type = option["option_type"]
-                    strike = option["strike"]
-                    expiry = option["expiration"]
-                    T = (expiry - date).total_seconds() / (365 * 24 * 3600)
-                    r = 0.03  # Assumed risk-free rate
-                    
-                    theoretical_price = self.heston_price(underlying_price, strike, T, r, option_type)
-                    market_price = (option["bid_px_00"] + option["ask_px_00"]) / 2
-                    
-                    if theoretical_price > market_price * 1.01:
-                        action = "B"
-                        size = min(10, int(option["ask_sz_00"]))
-                    elif theoretical_price < market_price * 0.99:
-                        action = "S"
-                        size = min(10, int(option["bid_sz_00"]))
-                    else:
-                        continue
-                    
-                    self.orders.append({
-                        "datetime": ts_recv,
-                        "option_symbol": symbol,
-                        "action": action,
-                        "order_size": size
-                    })
-                    
-                    if symbol not in self.positions:
-                        self.positions[symbol] = 0
-                    self.positions[symbol] += size if action == "B" else -size
-                
-                total_delta = 0
-                for symbol, position in self.positions.items():
-                    option = self.options[self.options["symbol"] == symbol].iloc[0]
-                    delta = self.calculate_delta(underlying_price, option["strike"], 
-                                                 (option["expiration"] - date).total_seconds() / (365 * 24 * 3600), 
-                                                 r, option["option_type"])
-                    total_delta += position * delta * 100
-                
-                hedge_size = int(-total_delta / 100)
-                if hedge_size != 0:
-                    atm_call = eligible_options[(eligible_options["option_type"] == "Call") & 
-                                                (eligible_options["strike"] == eligible_options["strike"].min())].iloc[0]
-                    atm_put = eligible_options[(eligible_options["option_type"] == "Put") & 
-                                               (eligible_options["strike"] == eligible_options["strike"].min())].iloc[0]
-                    
-                    self.orders.append({
-                        "datetime": ts_recv,
-                        "option_symbol": atm_call["symbol"],
-                        "action": "B" if hedge_size > 0 else "S",
-                        "order_size": abs(hedge_size)
-                    })
-                    
-                    self.orders.append({
-                        "datetime": ts_recv,
-                        "option_symbol": atm_put["symbol"],
-                        "action": "S" if hedge_size > 0 else "B",
-                        "order_size": abs(hedge_size)
-                    })
-        
-        return pd.DataFrame(self.orders)
+        for _, option in tqdm(self.options.iterrows(), total=self.options.shape[0]):
+            ts_recv = option['ts_recv']
+            underlying_price = self.get_underlying_price(ts_recv)
+            strike = option["strike"]
+            T = (option["expiry"] - ts_recv).total_seconds() / (365 * 24 * 3600)  # in years
+            market_price = (option['bid_px_00'] + option['ask_px_00']) / 2
+            theoretical_price = self.heston_price(underlying_price, strike, T, 0.03, option["type"])
 
-# Instantiate the strategy
-strategy = Strategy()
+            # Buy condition
+            if market_price < theoretical_price * 0.8:  # If market price is less than 80% of theoretical
+                order = {
+                    "symbol": option['symbol'],
+                    "type": option["type"],
+                    "strike": strike,
+                    "expiry": option['expiry'],
+                    "market_price": market_price,
+                    "theoretical_price": theoretical_price,
+                    "action": "B"  # Buy
+                }
+                self.orders.append(order)
 
-# Generate orders
-orders = strategy.generate_orders()
+            # Sell condition
+            if option['symbol'] in self.positions and market_price > theoretical_price * 1.2:
+                order = {
+                    "symbol": option['symbol'],
+                    "type": option["type"],
+                    "strike": strike,
+                    "expiry": option['expiry'],
+                    "market_price": market_price,
+                    "theoretical_price": theoretical_price,
+                    "action": "S"  # Sell
+                }
+                self.orders.append(order)
 
-# Print the first few orders
-print("\nFirst few generated orders:")
-print(orders.head())
+        # Save orders to a CSV file
+        orders_df = pd.DataFrame(self.orders)
+        orders_df.to_csv("generated_orders.csv", index=False)
 
-# Print some statistics about the orders
-print("\nOrder statistics:")
-print(f"Total number of orders: {len(orders)}")
-print(f"Number of buy orders: {len(orders[orders['action'] == 'B'])}")
-print(f"Number of sell orders: {len(orders[orders['action'] == 'S'])}")
-print(f"Average order size: {orders['order_size'].mean():.2f}")
+        return orders_df
+
+# Example usage:
+if __name__ == "__main__":
+    strategy = Strategy()
+    orders = strategy.generate_orders()
+    print(orders)

@@ -1,190 +1,279 @@
+import random
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from scipy.stats import norm
-from scipy.integrate import quad
-from scipy.optimize import minimize
-import pytz
-from tqdm import tqdm
+import itertools
+
 
 class Strategy:
-    def __init__(self) -> None:
-        self.capital: float = 100_000_000
-        self.portfolio_value: float = 0
-        self.start_date: datetime = datetime(2024, 1, 1, tzinfo=pytz.UTC)
-        self.end_date: datetime = datetime(2024, 3, 30, tzinfo=pytz.UTC)
-        
-        # Load and preprocess data
-        self.load_and_preprocess_data()
-        
-        # Initialize Heston parameters
-        self.kappa = 2.0
-        self.theta = 0.04
-        self.sigma = 0.3
-        self.rho = -0.7
-        self.v0 = 0.04
 
-        # Calibrate Heston parameters using historical data
-        self.calibrate_heston_parameters()
+  def __init__(self) -> None:
+    self.capital : float = 100_000_000
+    self.portfolio_value : float = 0
 
-        self.positions = {}
-        self.orders = []
+    self.start_date : datetime = datetime(2024, 1, 1)
+    self.end_date : datetime = datetime(2024, 3, 30)
 
-    def load_and_preprocess_data(self):
-        # Load options data
-        self.options = pd.read_csv("data/cleaned_options_data.csv")
-        self.options["ts_recv"] = pd.to_datetime(self.options["ts_recv"], utc=True)
-        
-        # Extract information from symbol
-        self.options['expiry'] = pd.to_datetime(self.options['symbol'].str.extract('(\d{6})')[0], format='%y%m%d', utc=True)
-        self.options['type'] = self.options['symbol'].str[-9].map({'C': 'Call', 'P': 'Put'})
-        self.options['strike'] = self.options['symbol'].str[-8:].astype(float) / 1000
-        
-        # Calculate days till expiry
-        self.options['days_till_expiry'] = (self.options['expiry'] - self.options['ts_recv']).dt.days
-        
-        # Create a 'day' column for filtering
-        self.options["day"] = self.options["ts_recv"].dt.date
-        
-        # Load underlying data
-        self.underlying = pd.read_csv("data/spx_minute_level_data_jan_mar_2024.csv")
-        self.underlying.columns = ["ms_of_day", "price", "date"]
-        self.underlying["date"] = pd.to_datetime(self.underlying["date"].astype(str), format="%Y%m%d")
-        self.underlying["time"] = pd.to_timedelta(self.underlying["ms_of_day"], unit='ms')
-        self.underlying["datetime"] = (self.underlying["date"] + self.underlying["time"]).dt.tz_localize('UTC')
-        self.underlying = self.underlying.sort_values("datetime")
+    self.options : pd.DataFrame = pd.read_csv("data/cleaned_options_data.csv")
+    self.options["day"] = self.options["ts_recv"].apply(lambda x: x.split("T")[0])
 
-    def calibrate_heston_parameters(self):
-        print("Calibrating Heston model parameters using historical data...")
-        
-        # Use data up to the start date for calibration
-        historical_options = self.options[self.options['ts_recv'] < self.start_date]
-        
-        if historical_options.empty:
-            print("No historical data available for calibration. Using default parameters.")
-            return
-        
-        # Select a subset of historical options for calibration
-        calibration_options = historical_options.sample(min(1000, len(historical_options)))
-        
-        # Define the objective function
-        def objective(params):
-            self.kappa, self.theta, self.sigma, self.rho, self.v0 = params
-            total_error = 0
-            for _, option in calibration_options.iterrows():
-                S = self.get_underlying_price(option['ts_recv'])
-                K = option['strike']
-                T = (option['expiry'] - option['ts_recv']).total_seconds() / (365 * 24 * 3600)
-                r = 0.03  # Assumed risk-free rate
-                market_price = (option['bid_px_00'] + option['ask_px_00']) / 2
-                model_price = self.heston_price(S, K, T, r, option['type'])
-                total_error += (market_price - model_price)**2
-            return total_error
+    self.underlying = pd.read_csv("data/underlying_data_hour.csv")
+    self.underlying.columns = self.underlying.columns.str.lower()
 
-        # Initial guess and bounds
-        initial_guess = [self.kappa, self.theta, self.sigma, self.rho, self.v0]
-        bounds = [(0.1, 10), (0.01, 0.5), (0.1, 1), (-0.99, 0.99), (0.01, 0.5)]
+  @classmethod
+  def parse_option_symbol(cls,symbol):
+    # Example: SPX 240119P04700000
+    numbers = symbol.split(' ')[3]
+    expiry_date = numbers[:6]  # Expiry date in YYMMDD format
+    option_type = numbers[6]  # P for put, C for call
+    strike_price = float(numbers[7:]) / 1000  # Strike price divided by 1000
+    return expiry_date, option_type, strike_price
 
-        # Perform the optimization
-        result = minimize(objective, initial_guess, method='L-BFGS-B', bounds=bounds)
+  @classmethod
+  def third_friday_of_month(cls,date):
+    # First day of the month
+    first_day_of_month = date.replace(day=1)
 
-        # Update the parameters
-        self.kappa, self.theta, self.sigma, self.rho, self.v0 = result.x
+    # Find the first Friday of the month
+    first_friday_offset = (4 - first_day_of_month.weekday()) % 7  # 4 corresponds to Friday
+    first_friday = first_day_of_month + timedelta(days=first_friday_offset)
 
-        print(f"Calibrated parameters: kappa={self.kappa:.4f}, theta={self.theta:.4f}, "
-              f"sigma={self.sigma:.4f}, rho={self.rho:.4f}, v0={self.v0:.4f}")
+    # The third Friday is 14 days after the first Friday
+    third_friday = first_friday + timedelta(weeks=2)
 
-    def heston_characteristic_function(self, u, S, K, T, r, v):
-        i = complex(0, 1)
-        
-        a = self.kappa * self.theta
-        b = self.kappa - self.rho * self.sigma * i * u
-        
-        d = np.sqrt(b**2 + self.sigma**2 * (u**2 + i*u))
-        g = (b - d) / (b + d)
-        
-        C = r * i * u * T + a / self.sigma**2 * (
-            (b - d) * T - 2 * np.log((1 - g * np.exp(-d * T)) / (1 - g))
-        )
-        D = (b - d) / self.sigma**2 * ((1 - np.exp(-d * T)) / (1 - g * np.exp(-d * T)))
-        
-        return np.exp(C + D * v + i * u * np.log(S))
+    # If the current date is after the third Friday, move to the next month's third Friday
+    if date > third_friday:
+        # Move to the next month's first day
+        next_month = (date.month % 12) + 1
+        year = date.year + (1 if date.month == 12 else 0)
+        first_day_of_next_month = datetime(year, next_month, 1)
 
-    def heston_price(self, S, K, T, r, option_type):
-        v = self.v0  # Use the calibrated initial variance
-        i = complex(0, 1)  # Define the imaginary unit
-    
-        def integrand(u, S, K, T, r, v, flag):
-            if flag:
-                return np.real(np.exp(-i*u*np.log(K)) * self.heston_characteristic_function(u-i, S, K, T, r, v) / (i*u))
-            else:
-                return np.real(np.exp(-i*u*np.log(K)) * self.heston_characteristic_function(u, S, K, T, r, v) / (i*u))
-    
-        P1 = 0.5 + 1/np.pi * quad(integrand, 0, 100, args=(S, K, T, r, v, True))[0]
-        P2 = 0.5 + 1/np.pi * quad(integrand, 0, 100, args=(S, K, T, r, v, False))[0]
-    
-        if option_type == "Call":
-            return S * P1 - K * np.exp(-r * T) * P2
-        else:
-            return K * np.exp(-r * T) * (1 - P2) - S * (1 - P1)
+        # Recalculate the third Friday for the next month
+        first_friday_offset = (4 - first_day_of_next_month.weekday()) % 7
+        first_friday = first_day_of_next_month + timedelta(days=first_friday_offset)
+        third_friday = first_friday + timedelta(weeks=2)
 
-    def calculate_delta(self, S, K, T, r, option_type):
-        epsilon = 0.0001
-        price1 = self.heston_price(S - epsilon, K, T, r, option_type)
-        price2 = self.heston_price(S + epsilon, K, T, r, option_type)
-        return (price2 - price1) / (2 * epsilon)
+    return third_friday
 
-    def get_underlying_price(self, datetime):
-        # Convert the input datetime to UTC to match the underlying data format
-        datetime_utc = datetime.astimezone(pytz.UTC)
-        
-        # Select the price based on the most recent datetime
-        price = self.underlying[self.underlying["datetime"] <= datetime_utc]["price"].iloc[-1]
-        return price
+  @classmethod
+  def get_best_spreads(cls, df):
+      # Reset index to preserve original indices
+      df = df.reset_index().rename(columns={'index': 'idx_1'})
 
-    def generate_orders(self) -> pd.DataFrame:
-        for _, option in tqdm(self.options.iterrows(), total=self.options.shape[0]):
-            ts_recv = option['ts_recv']
-            underlying_price = self.get_underlying_price(ts_recv)
-            strike = option["strike"]
-            T = (option["expiry"] - ts_recv).total_seconds() / (365 * 24 * 3600)  # in years
-            market_price = (option['bid_px_00'] + option['ask_px_00']) / 2
-            theoretical_price = self.heston_price(underlying_price, strike, T, 0.03, option["type"])
+      # Add a temporary key column for cross join
+      df['key'] = 1
 
-            # Buy condition
-            if market_price < theoretical_price * 0.8:  # If market price is less than 80% of theoretical
-                order = {
-                    "symbol": option['symbol'],
-                    "type": option["type"],
-                    "strike": strike,
-                    "expiry": option['expiry'],
-                    "market_price": market_price,
-                    "theoretical_price": theoretical_price,
-                    "action": "B"  # Buy
-                }
-                self.orders.append(order)
+      # Perform a self-merge to create all combinations within the same option type
+      df_merged = df.merge(df, on='key', suffixes=('_1', '_2'))
 
-            # Sell condition
-            if option['symbol'] in self.positions and market_price > theoretical_price * 1.2:
-                order = {
-                    "symbol": option['symbol'],
-                    "type": option["type"],
-                    "strike": strike,
-                    "expiry": option['expiry'],
-                    "market_price": market_price,
-                    "theoretical_price": theoretical_price,
-                    "action": "S"  # Sell
-                }
-                self.orders.append(order)
+      # Remove temporary key column
+      df_merged = df_merged.drop(columns=['key'])
 
-        # Save orders to a CSV file
-        orders_df = pd.DataFrame(self.orders)
-        orders_df.to_csv("generated_orders.csv", index=False)
+      # Filter out self-pairs and duplicate pairs
+      df_merged = df_merged[df_merged['idx_1_1'] < df_merged['idx_1_2']]
 
-        return orders_df
+      # Only consider pairs with the same option type
+      df_merged = df_merged[df_merged['typ_1'] == df_merged['typ_2']]
 
-# Example usage:
-if __name__ == "__main__":
-    strategy = Strategy()
-    orders = strategy.generate_orders()
-    print(orders)
+      # Exclude pairs with the same strike price
+      df_merged = df_merged[df_merged['strike_1'] != df_merged['strike_2']]
+
+      # Calculate strike difference
+      df_merged['strike_diff'] = df_merged['strike_1'] - df_merged['strike_2']
+      df_merged['abs_strike_diff'] = df_merged['strike_diff'].abs()
+
+      # Initialize necessary columns
+      df_merged['long_spread_price'] = np.nan
+      df_merged['short_spread_price'] = np.nan
+      df_merged['long_idxs_buy'] = np.nan
+      df_merged['long_idxs_sell'] = np.nan
+      df_merged['short_idxs_buy'] = np.nan
+      df_merged['short_idxs_sell'] = np.nan
+      df_merged['long_szs'] = np.nan
+      df_merged['short_szs'] = np.nan
+
+      # Create masks for conditions
+      mask_typ_C = df_merged['typ_1'] == 'C'
+      mask_typ_P = df_merged['typ_1'] == 'P'
+      mask_strike_diff_neg = df_merged['strike_diff'] < 0
+      mask_strike_diff_pos = df_merged['strike_diff'] > 0
+
+      # Case 1: Call options where strike_diff < 0
+      mask_case1 = mask_typ_C & mask_strike_diff_neg
+      df_merged.loc[mask_case1, 'long_spread_price'] = df_merged.loc[mask_case1, 'ask_px_00_1'] - df_merged.loc[mask_case1, 'bid_px_00_2']
+      df_merged.loc[mask_case1, 'short_spread_price'] = -df_merged.loc[mask_case1, 'bid_px_00_1'] + df_merged.loc[mask_case1, 'ask_px_00_2']
+      df_merged.loc[mask_case1, 'long_idxs_buy'] = df_merged.loc[mask_case1, 'idx_1_1']
+      df_merged.loc[mask_case1, 'long_idxs_sell'] = df_merged.loc[mask_case1, 'idx_1_2']
+      df_merged.loc[mask_case1, 'short_idxs_buy'] = df_merged.loc[mask_case1, 'idx_1_2']
+      df_merged.loc[mask_case1, 'short_idxs_sell'] = df_merged.loc[mask_case1, 'idx_1_1']
+      df_merged.loc[mask_case1, 'long_szs'] = df_merged.loc[mask_case1, ['ask_sz_00_1', 'bid_sz_00_2']].min(axis=1)
+      df_merged.loc[mask_case1, 'short_szs'] = df_merged.loc[mask_case1, ['bid_sz_00_1', 'ask_sz_00_2']].min(axis=1)
+
+      # Case 2: Call options where strike_diff > 0
+      mask_case2 = mask_typ_C & mask_strike_diff_pos
+      df_merged.loc[mask_case2, 'long_spread_price'] = df_merged.loc[mask_case2, 'ask_px_00_2'] - df_merged.loc[mask_case2, 'bid_px_00_1']
+      df_merged.loc[mask_case2, 'short_spread_price'] = -df_merged.loc[mask_case2, 'bid_px_00_2'] + df_merged.loc[mask_case2, 'ask_px_00_1']
+      df_merged.loc[mask_case2, 'long_idxs_buy'] = df_merged.loc[mask_case2, 'idx_1_2']
+      df_merged.loc[mask_case2, 'long_idxs_sell'] = df_merged.loc[mask_case2, 'idx_1_1']
+      df_merged.loc[mask_case2, 'short_idxs_buy'] = df_merged.loc[mask_case2, 'idx_1_1']
+      df_merged.loc[mask_case2, 'short_idxs_sell'] = df_merged.loc[mask_case2, 'idx_1_2']
+      df_merged.loc[mask_case2, 'long_szs'] = df_merged.loc[mask_case2, ['bid_sz_00_1', 'ask_sz_00_2']].min(axis=1)
+      df_merged.loc[mask_case2, 'short_szs'] = df_merged.loc[mask_case2, ['ask_sz_00_1', 'bid_sz_00_2']].min(axis=1)
+
+      # Case 3: Put options where strike_diff < 0
+      mask_case3 = mask_typ_P & mask_strike_diff_neg
+      df_merged.loc[mask_case3, 'long_spread_price'] = -df_merged.loc[mask_case3, 'bid_px_00_1'] + df_merged.loc[mask_case3, 'ask_px_00_2']
+      df_merged.loc[mask_case3, 'short_spread_price'] = df_merged.loc[mask_case3, 'ask_px_00_1'] - df_merged.loc[mask_case3, 'bid_px_00_2']
+      df_merged.loc[mask_case3, 'long_idxs_buy'] = df_merged.loc[mask_case3, 'idx_1_2']
+      df_merged.loc[mask_case3, 'long_idxs_sell'] = df_merged.loc[mask_case3, 'idx_1_1']
+      df_merged.loc[mask_case3, 'short_idxs_buy'] = df_merged.loc[mask_case3, 'idx_1_1']
+      df_merged.loc[mask_case3, 'short_idxs_sell'] = df_merged.loc[mask_case3, 'idx_1_2']
+      df_merged.loc[mask_case3, 'long_szs'] = df_merged.loc[mask_case3, ['bid_sz_00_1', 'ask_sz_00_2']].min(axis=1)
+      df_merged.loc[mask_case3, 'short_szs'] = df_merged.loc[mask_case3, ['ask_sz_00_1', 'bid_sz_00_2']].min(axis=1)
+
+      # Case 4: Put options where strike_diff > 0
+      mask_case4 = mask_typ_P & mask_strike_diff_pos
+      df_merged.loc[mask_case4, 'long_spread_price'] = -df_merged.loc[mask_case4, 'ask_px_00_2'] + df_merged.loc[mask_case4, 'ask_px_00_1']
+      df_merged.loc[mask_case4, 'short_spread_price'] = df_merged.loc[mask_case4, 'ask_px_00_2'] - df_merged.loc[mask_case4, 'bid_px_00_1']
+      df_merged.loc[mask_case4, 'long_idxs_buy'] = df_merged.loc[mask_case4, 'idx_1_1']
+      df_merged.loc[mask_case4, 'long_idxs_sell'] = df_merged.loc[mask_case4, 'idx_1_2']
+      df_merged.loc[mask_case4, 'short_idxs_buy'] = df_merged.loc[mask_case4, 'idx_1_2']
+      df_merged.loc[mask_case4, 'short_idxs_sell'] = df_merged.loc[mask_case4, 'idx_1_1']
+      df_merged.loc[mask_case4, 'long_szs'] = df_merged.loc[mask_case4, ['ask_sz_00_1', 'bid_sz_00_2']].min(axis=1)
+      df_merged.loc[mask_case4, 'short_szs'] = df_merged.loc[mask_case4, ['bid_sz_00_1', 'ask_sz_00_2']].min(axis=1)
+
+      # Calculate profits
+      df_merged['long_profit'] = df_merged['abs_strike_diff'] - df_merged['long_spread_price']
+      df_merged['short_profit'] = -df_merged['abs_strike_diff'] - df_merged['short_spread_price']
+
+      # Determine the more profitable spread type
+      mask_long_better = df_merged['long_profit'] >= df_merged['short_profit']
+      df_merged['profit'] = np.where(mask_long_better, df_merged['long_profit'], df_merged['short_profit'])
+      df_merged['buy_idx'] = np.where(mask_long_better, df_merged['long_idxs_buy'], df_merged['short_idxs_buy']).astype(int)
+      df_merged['sell_idx'] = np.where(mask_long_better, df_merged['long_idxs_sell'], df_merged['short_idxs_sell']).astype(int)
+      df_merged['max_size'] = np.where(mask_long_better, df_merged['long_szs'], df_merged['short_szs']).astype(int)
+
+      df_merged['adj_profit'] = np.where(mask_long_better, df_merged['profit'] / df_merged['long_spread_price'] * df_merged['max_size'],
+                                                           df_merged['profit'] / df_merged['abs_strike_diff'] * df_merged['max_size'] )
+
+      # Select relevant columns
+      df_results = df_merged[[
+          'strike_1', 'strike_2', 'strike_diff', 'long_spread_price', 'short_spread_price',
+          'long_profit', 'short_profit', 'profit','adj_profit', 'buy_idx', 'sell_idx', 'max_size', 'typ_1'
+      ]].rename(columns={'typ_1': 'typ'})
+
+      # Sort and remove duplicates
+      df_results = df_results.sort_values(by=['profit','adj_profit','strike_diff'], ascending=[False,False,True])
+      df_results = df_results.drop_duplicates(subset=['buy_idx'], keep='first')
+      df_results = df_results.drop_duplicates(subset=['sell_idx'], keep='first')
+
+      # Reset index for clarity
+      df_results.reset_index(drop=True, inplace=True)
+
+      return df_results
+
+  def generate_orders(self) -> pd.DataFrame:
+    #given that we are supposed to trade options day by day, we iterate over every day in the orders
+
+    def convert_timestamp_utc(x,tz = timedelta(hours = 5)):
+      return datetime.strptime(x[:19], "%Y-%m-%d %H:%M:%S") + tz
+
+    #get daily open price, given that the options will be settled on open price on third friday of the week
+    daily_underlying_open = self.underlying[self.underlying['date'].apply(convert_timestamp_utc).apply(lambda x: x.hour) == 14]
+    daily_underlying_open['datetime'] = pd.to_datetime(daily_underlying_open['date'])
+    daily_underlying_rolling_stds = daily_underlying_open['open'].rolling(window = 10).std()
+
+
+
+    all_orders = []
+
+    for day, group in self.options.groupby('day'):
+       current_date = pd.to_datetime(day)
+       print('current date: %s'%current_date.date())
+       current_expiry = Strategy.third_friday_of_month(current_date)
+       current_expiry_str = current_expiry.strftime('%y%m%d')
+
+       current_time_to_expiry = current_expiry - current_date
+       if current_time_to_expiry.days <= 0:
+        current_expiry = Strategy.third_friday_of_month(current_date + timedelta(days = 15))
+        current_expiry_str = current_expiry.strftime('%y%m%d')
+        current_time_to_expiry = current_expiry - current_date
+
+       #get trailing daily open price stds
+       #get current idx
+       current_idx = daily_underlying_open['datetime'].apply(lambda x: x.date()) == current_date.date()
+       current_rolling_std = daily_underlying_rolling_stds.loc[current_idx].iloc[0]
+       current_underlying_open = daily_underlying_open.loc[current_idx]['open'].iloc[0]
+
+       #trade options that expires within 4 days
+
+       #if current_time_to_expiry > timedelta(days=4) or current_time_to_expiry.days <= 0:
+       #   continue
+
+       if np.isnan(current_rolling_std):
+        continue
+
+       #scaled it to match the remaining expiry
+       current_std_scaled = (current_rolling_std * (current_time_to_expiry / timedelta(days = 1))**0.5)
+
+       strike_upper = current_underlying_open + 3 * current_std_scaled
+       strike_lower = current_underlying_open - 3 * current_std_scaled
+
+       temp = group['symbol'].apply(Strategy.parse_option_symbol)
+       group['expiry']= temp.apply(lambda x: x[0])
+       group['typ'] = temp.apply(lambda x: x[1])
+       group['strike']= temp.apply(lambda x: x[2])
+       #generate orders for out of money calls
+
+       itm_put_orders = group[(group['strike'] >= strike_upper) &
+                               (group['typ'] == 'P') &
+                               (group['expiry'] == current_expiry_str)]
+
+
+       itm_call_orders = group[(group['strike'] <= strike_lower) &
+                               (group['typ'] == 'C') &
+                               (group['expiry'] == current_expiry_str)]
+
+       pairs_call = Strategy.get_best_spreads(itm_call_orders).iloc[:2]
+       pairs_put = Strategy.get_best_spreads(itm_put_orders).iloc[:2]
+
+       if pairs_call.size != 0 and np.sum(pairs_call['profit'] > 0) !=  0:
+        best_pairs_call = pairs_call.loc[pairs_call['adj_profit'].idxmax()]
+
+        buy_orders = itm_call_orders.loc[best_pairs_call['buy_idx']]
+        buy_orders['action'] = 'B'
+        buy_orders['order_size'] = best_pairs_call['max_size']
+
+        sell_orders = itm_call_orders.loc[best_pairs_call['sell_idx']]
+        sell_orders['action'] = 'S'
+        sell_orders['order_size'] = best_pairs_call['max_size']
+
+        all_orders.append(buy_orders[['ts_recv','symbol', 'action', 'order_size']])
+        all_orders.append(sell_orders[['ts_recv','symbol', 'action', 'order_size']])
+
+       '''
+       if pairs_put.size != 0 and np.sum(pairs_put['profit'] > 0) !=  0:
+        best_pairs_put = pairs_put.loc[pairs_put['adj_profit'].idxmax()]
+
+        buy_orders = itm_put_orders.loc[best_pairs_put['buy_idx']]
+        buy_orders['action'] = 'B'
+        buy_orders['order_size'] = best_pairs_put['max_size']
+
+        sell_orders = itm_put_orders.loc[best_pairs_put['sell_idx']]
+        sell_orders['action'] = 'S'
+        sell_orders['order_size'] = best_pairs_put['max_size']
+
+        all_orders.append(buy_orders[['ts_recv','symbol', 'action', 'order_size']])
+        all_orders.append(sell_orders[['ts_recv','symbol', 'action', 'order_size']])
+       '''
+
+
+
+
+    result = pd.DataFrame(all_orders)
+    result.rename(columns = {
+                             'ts_recv': 'datetime',
+                             'symbol': 'option_symbol'}, inplace = True)
+    #temp change
+    return result.reset_index(drop = True)
+

@@ -14,14 +14,6 @@ The Cornell Trading Competition (CTC) 2024 challenges participants to craft a tr
 - **Training Data**: 3 months of SPX options NBBO data and SPY data
 - **Testing**: Three distinct 3-month periods (varying by average VIX)
 
-### Evaluation Metrics
-
-1. Total Return
-2. Max Drawdown
-3. Sharpe Ratio
-4. Consistency Score
-5. Final Score (combines total return, risk management, and consistency)
-
 ## Our Strategy
 
 Our approach targets pricing inefficiencies in deep in-the-money (ITM) options while maintaining a balanced risk profile:

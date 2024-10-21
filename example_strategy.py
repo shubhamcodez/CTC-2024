@@ -13,7 +13,7 @@ class Strategy:
 
     self.start_date : datetime = datetime(2024, 1, 1)
     self.end_date : datetime = datetime(2024, 3, 30)
-
+  
     self.options : pd.DataFrame = pd.read_csv("data/cleaned_options_data.csv")
     self.options["day"] = self.options["ts_recv"].apply(lambda x: x.split("T")[0])
 

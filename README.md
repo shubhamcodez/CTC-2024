@@ -6,7 +6,7 @@ The Cornell Trading Competition (CTC) 2024 challenges participants to craft a tr
 
 ### Key Competition Details
 
-- **Initial Capital**: $1,000,000,000
+- **Initial Capital**: $100,000,000
 - **Underlying Asset**: S&P 500 Index
 - **Instruments**: SPX Options (European-style, cash-settled)
 - **Contract Multiplier**: 100

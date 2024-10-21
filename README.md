@@ -2,7 +2,7 @@
 
 ### Our Performance
 Max Drawdown: 0.01335554 <br>
-Overall Return: 98.9015495 <br>
+Overall Return: 98.9015495 % <br>
 Sharpe Ratio: 884.6000 <br>
 Overall Score: 6550778.4846 <br>
 

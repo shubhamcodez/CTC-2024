@@ -1,11 +1,16 @@
 # CTC-2024-Derivatives
 
-### Baseline Performance
-Max Drawdown: 2.657155242141752
-Overall Return: -367.1799161720705%
-Sharpe Ratio: 0.03547925065679643
-Overall Score: -4.90271252330368
+### Our Performance
+Max Drawdown: 0.01335554 <br>
+Overall Return: 98.9015495 % <br>
+Sharpe Ratio: 884.6000 <br>
+Overall Score: 6550778.4846 <br>
 
+### Baseline Performance
+Max Drawdown: 2.657155242141752 <br>
+Overall Return: -367.1799161720705% <br>
+Sharpe Ratio: 0.03547925065679643 <br>
+Overall Score: -4.90271252330368 <br>
 
 `data` - folder containing options data, s&p underlying prices, and a sample csv output of what your strategy should generate
 
